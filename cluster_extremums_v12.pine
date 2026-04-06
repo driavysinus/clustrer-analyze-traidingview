@@ -1,0 +1,795 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Cluster Extremums (Fixed Values) v12
+
+//@version=6
+indicator("Кластеры экстремумов v12", overlay=true, max_lines_count=50, max_labels_count=500)
+
+// ============================================================================
+// ВХОДНЫЕ ПАРАМЕТРЫ
+// ============================================================================
+
+// --- Группа: Поиск экстремумов ---
+leftBars        = input.int(10,    "Баров слева",               minval=1,  group="Поиск экстремумов")
+rightBars       = input.int(10,    "Баров справа",              minval=1,  group="Поиск экстремумов")
+lookback_bars   = input.int(1000,  "Глубина поиска абс. экстр.",minval=50, maxval=5000, group="Поиск экстремумов")
+
+// --- Группа: Кластеризация ---
+cluster_threshold       = input.float(2.0,  "Порог кластера (%)",        minval=0.001, step=0.001, group="Кластеризация") / 100.0
+min_cluster_size        = input.int(4,       "Мин. размер кластера",      minval=2,     group="Кластеризация")
+use_only_recent         = input.bool(true,   "Только последние экстремумы",              group="Кластеризация")
+recent_extremums_count  = input.int(30,      "Кол-во последних экстремумов",minval=10,  group="Кластеризация")
+recalc_bars             = input.int(500,     "Пересчёт каждые N баров",   minval=10,    group="Кластеризация")
+max_active_clusters     = input.int(15,      "Макс. активных кластеров",  minval=1, maxval=20, group="Кластеризация")
+
+// --- Группа: Offset линии ---
+offset_percent  = input.float(0.0005, "Отступ offset (%)",  minval=0.0001, step=0.0001, group="Offset линии")
+
+// --- Группа: Логика запилов ---
+bars_offset                 = input.int(1,     "Баров ожидания подтверждения", minval=1,  group="Логика запилов")
+enable_breakthrough_logic   = input.bool(true, "Включить логику запилов",                 group="Логика запилов")
+show_breakthrough_labels    = input.bool(true, "Показывать метки запилов",                group="Логика запилов")
+enable_offset_alerts        = input.bool(true, "Алерты offset-касаний",                   group="Логика запилов")
+max_breakthroughs           = input.int(2,     "Макс. запилов до деактивации", minval=1,  group="Логика запилов")
+preserve_labels             = input.bool(false,"Сохранять метки при пересчёте",            group="Логика запилов")
+
+// --- Группа: Оповещения ---
+alert_tolerance_percent = input.float(0.2, "Допуск алерта (%)", minval=0.01, step=0.01, group="Оповещения") / 100.0
+
+// --- Группа: Отображение ---
+show_absolute_lines  = input.bool(true, "Линии абс. экстремумов",  group="Отображение")
+show_cluster_lines   = input.bool(true, "Основные линии кластеров", group="Отображение")
+show_offset_lines    = input.bool(true, "Offset-линии кластеров",   group="Отображение")
+show_fill            = input.bool(true, "Заливка offset-зоны",      group="Отображение")
+show_cluster_labels  = input.bool(true, "Подписи размера кластеров",group="Отображение")
+
+// ============================================================================
+// КОНСТАНТЫ СТИЛЕЙ
+// ============================================================================
+
+CLUSTER_LINE_WIDTH      = 2
+OFFSET_LINE_WIDTH       = 1
+ABS_LINE_WIDTH          = 3
+PIVOT_LABEL_SIZE        = size.tiny
+CLUSTER_LABEL_SIZE      = size.small
+BREAKTHROUGH_LABEL_SIZE = size.normal
+
+COLOR_HIGH_CLUSTER = #ffa500
+COLOR_LOW_CLUSTER  = #0000ff
+
+// ============================================================================
+// ТИПЫ ДАННЫХ
+// ============================================================================
+
+type ExtremumData
+    float price
+    int   bar_idx
+    int   bar_tm
+    bool  is_clustered
+
+type BreakthroughLabelInfo
+    label label_obj
+    int   breakthrough_num
+    float level
+    int   created_bar
+
+type UnifiedClusterData
+    string cluster_id
+    float  avg_level
+    float  upper_offset_level
+    float  lower_offset_level
+    int    cluster_size
+    bool   is_high
+    int    start_bar
+    int    end_bar
+    int    start_time
+    int    end_time
+    string status
+    int    breakthrough_count
+    int    pending_confirmation_bar
+    bool   has_touched_level
+    bool   came_from_correct_side
+    int    last_breakthrough_bar
+    bool   breakthrough_in_progress
+    bool   upper_offset_touched
+    bool   lower_offset_touched
+    line      cluster_line
+    line      upper_offset_line
+    line      lower_offset_line
+    linefill  offset_fill
+    label     cluster_label
+    array<label> breakthrough_labels
+
+// ============================================================================
+// ГЛОБАЛЬНЫЕ МАССИВЫ
+// ============================================================================
+
+var array<ExtremumData>       high_extremums   = array.new<ExtremumData>()
+var array<ExtremumData>       low_extremums    = array.new<ExtremumData>()
+var array<UnifiedClusterData> unified_clusters = array.new<UnifiedClusterData>()
+var array<BreakthroughLabelInfo> bt_label_infos = array.new<BreakthroughLabelInfo>()
+
+var line abs_high_line = na
+var line abs_low_line  = na
+var bool data_exported = false
+var bool alert_upper_offset_fired = false
+var bool alert_lower_offset_fired = false
+
+// ============================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================================
+
+limit_array_size(array<ExtremumData> extremums) =>
+    int max_sz = use_only_recent ? recent_extremums_count : 30
+    while array.size(extremums) > max_sz
+        array.shift(extremums)
+
+find_absolute_extremums() =>
+    int lb = math.min(lookback_bars, bar_index, 4999)
+    float abs_h = high
+    float abs_l = low
+    if lb > 0
+        for i = 1 to lb
+            if high[i] > abs_h
+                abs_h := high[i]
+            if low[i] < abs_l
+                abs_l := low[i]
+    [abs_h, abs_l]
+
+check_level_touch(float cluster_level) =>
+    float tol = cluster_level * 0.005
+    low <= cluster_level + tol and high >= cluster_level - tol
+
+check_approach_direction(float cluster_level, bool is_high_cluster) =>
+    float tol = cluster_level * 0.005
+    if is_high_cluster
+        low <= cluster_level + tol
+    else
+        high >= cluster_level - tol
+
+check_confirmation_simple(UnifiedClusterData cluster) =>
+    float tol = cluster.avg_level * 0.002
+    if cluster.is_high
+        close > cluster.avg_level - tol
+    else
+        close < cluster.avg_level + tol
+
+is_valid_offset_alert(float cluster_level, float current_price, float tolerance_pct) =>
+    float tol_val = cluster_level * tolerance_pct
+    float max_dist = cluster_level * 0.0002
+    math.abs(current_price - cluster_level) <= tol_val and math.abs(current_price - cluster_level) <= max_dist
+
+// ============================================================================
+// ФУНКЦИЯ КЛАСТЕРИЗАЦИИ
+// ============================================================================
+
+find_clusters(array<ExtremumData> extremums, bool is_high) =>
+    array<UnifiedClusterData> result = array.new<UnifiedClusterData>()
+
+    int total = array.size(extremums)
+    if total >= min_cluster_size
+        int sample_start = use_only_recent ? math.max(0, total - recent_extremums_count) : 0
+        int sample_end   = total - 1
+        array<bool> used = array.new<bool>(total, false)
+
+        for seed_i = sample_start to sample_end
+            if not array.get(used, seed_i)
+                ExtremumData seed = array.get(extremums, seed_i)
+                array<int> members = array.new<int>()
+                array.push(members, seed_i)
+
+                float avg = seed.price
+                bool stable = false
+                int iter_count = 0
+
+                while not stable and iter_count < 10
+                    iter_count += 1
+                    stable := true
+                    float thresh = avg * cluster_threshold
+
+                    for j = sample_start to sample_end
+                        if not array.get(used, j)
+                            bool already_in = false
+                            int mem_sz = array.size(members)
+                            if mem_sz > 0
+                                for k = 0 to mem_sz - 1
+                                    if array.get(members, k) == j
+                                        already_in := true
+                                        break
+                            if not already_in
+                                ExtremumData ext = array.get(extremums, j)
+                                if math.abs(ext.price - avg) <= thresh
+                                    array.push(members, j)
+                                    stable := false
+
+                    int mem_sz2 = array.size(members)
+                    if mem_sz2 > 0
+                        float sum_p = 0.0
+                        for m = 0 to mem_sz2 - 1
+                            int idx = array.get(members, m)
+                            sum_p += array.get(extremums, idx).price
+                        avg := sum_p / mem_sz2
+
+                if array.size(members) >= min_cluster_size
+                    float similar_thresh = avg * cluster_threshold * 0.8
+                    bool too_similar = false
+
+                    int res_sz = array.size(result)
+                    if res_sz > 0
+                        for r = 0 to res_sz - 1
+                            if math.abs(array.get(result, r).avg_level - avg) < similar_thresh
+                                too_similar := true
+                                break
+
+                    if not too_similar
+                        int uc_sz = array.size(unified_clusters)
+                        if uc_sz > 0
+                            for r = 0 to uc_sz - 1
+                                UnifiedClusterData uc = array.get(unified_clusters, r)
+                                if uc.status == "active" and uc.is_high == is_high
+                                    if math.abs(uc.avg_level - avg) < similar_thresh
+                                        too_similar := true
+                                        break
+
+                    if not too_similar
+                        int s_bar = bar_index
+                        int e_bar = 0
+                        int s_tm  = timenow
+                        int e_tm  = 0
+                        int mem_sz3 = array.size(members)
+                        if mem_sz3 > 0
+                            for m = 0 to mem_sz3 - 1
+                                int idx = array.get(members, m)
+                                ExtremumData ext = array.get(extremums, idx)
+                                array.set(used, idx, true)
+                                ext.is_clustered := true
+                                if ext.bar_idx < s_bar
+                                    s_bar := ext.bar_idx
+                                if ext.bar_idx > e_bar
+                                    e_bar := ext.bar_idx
+                                if ext.bar_tm < s_tm
+                                    s_tm := ext.bar_tm
+                                if ext.bar_tm > e_tm
+                                    e_tm := ext.bar_tm
+
+                        float up_off = avg * (1.0 + offset_percent)
+                        float dn_off = avg * (1.0 - offset_percent)
+                        string cid = str.tostring(avg) + "_" + (is_high ? "HIGH" : "LOW") + "_" + str.tostring(e_tm)
+
+                        UnifiedClusterData cl = UnifiedClusterData.new(
+                             cluster_id              = cid,
+                             avg_level               = avg,
+                             upper_offset_level      = up_off,
+                             lower_offset_level      = dn_off,
+                             cluster_size            = array.size(members),
+                             is_high                 = is_high,
+                             start_bar               = s_bar,
+                             end_bar                 = e_bar,
+                             start_time              = s_tm,
+                             end_time                = e_tm,
+                             status                  = "active",
+                             breakthrough_count      = 0,
+                             pending_confirmation_bar = 0,
+                             has_touched_level       = false,
+                             came_from_correct_side  = false,
+                             last_breakthrough_bar   = 0,
+                             breakthrough_in_progress = false,
+                             upper_offset_touched    = false,
+                             lower_offset_touched    = false,
+                             cluster_line            = line(na),
+                             upper_offset_line       = line(na),
+                             lower_offset_line       = line(na),
+                             offset_fill             = linefill(na),
+                             cluster_label           = label(na),
+                             breakthrough_labels     = array.new<label>())
+
+                        array.push(result, cl)
+
+                array.set(used, seed_i, true)
+
+    result
+
+// ============================================================================
+// ГРАФИКА КЛАСТЕРОВ
+// ============================================================================
+
+create_cluster_graphics(UnifiedClusterData cluster) =>
+    color base_col = cluster.is_high ? COLOR_HIGH_CLUSTER : COLOR_LOW_CLUSTER
+
+    // Линия начинается от самого старого экстремума кластера (start_bar)
+    // и тянется через end_bar вправо до края графика (extend.right)
+    int x1 = cluster.start_bar
+    int x2 = math.max(cluster.end_bar, cluster.start_bar + 1)
+
+    if show_cluster_lines
+        cluster.cluster_line := line.new(
+             x1=x1, y1=cluster.avg_level,
+             x2=x2, y2=cluster.avg_level,
+             color=base_col, width=CLUSTER_LINE_WIDTH, extend=extend.right)
+
+    if show_offset_lines
+        cluster.upper_offset_line := line.new(
+             x1=x1, y1=cluster.upper_offset_level,
+             x2=x2, y2=cluster.upper_offset_level,
+             color=color.new(base_col, 50), width=OFFSET_LINE_WIDTH,
+             style=line.style_dashed, extend=extend.right)
+        cluster.lower_offset_line := line.new(
+             x1=x1, y1=cluster.lower_offset_level,
+             x2=x2, y2=cluster.lower_offset_level,
+             color=color.new(base_col, 50), width=OFFSET_LINE_WIDTH,
+             style=line.style_dashed, extend=extend.right)
+
+    if show_fill and not na(cluster.upper_offset_line) and not na(cluster.lower_offset_line)
+        cluster.offset_fill := linefill.new(
+             cluster.upper_offset_line, cluster.lower_offset_line,
+             color.new(base_col, 85))
+
+    if show_cluster_labels
+        cluster.cluster_label := label.new(
+             x=x1, y=cluster.avg_level,
+             text=str.tostring(cluster.cluster_size),
+             style=cluster.is_high ? label.style_label_down : label.style_label_up,
+             color=color.new(base_col, 60), textcolor=color.white,
+             size=CLUSTER_LABEL_SIZE)
+
+delete_cluster_graphics(UnifiedClusterData cluster) =>
+    if not na(cluster.offset_fill)
+        linefill.delete(cluster.offset_fill)
+        cluster.offset_fill := linefill(na)
+    if not na(cluster.cluster_line)
+        line.delete(cluster.cluster_line)
+        cluster.cluster_line := line(na)
+    if not na(cluster.upper_offset_line)
+        line.delete(cluster.upper_offset_line)
+        cluster.upper_offset_line := line(na)
+    if not na(cluster.lower_offset_line)
+        line.delete(cluster.lower_offset_line)
+        cluster.lower_offset_line := line(na)
+    if not na(cluster.cluster_label)
+        label.delete(cluster.cluster_label)
+        cluster.cluster_label := label(na)
+
+deactivate_cluster_immediately(UnifiedClusterData cluster) =>
+    delete_cluster_graphics(cluster)
+    int bt_sz = array.size(cluster.breakthrough_labels)
+    if bt_sz > 0
+        for i = bt_sz - 1 to 0
+            label lbl = array.get(cluster.breakthrough_labels, i)
+            if not na(lbl)
+                label.delete(lbl)
+        array.clear(cluster.breakthrough_labels)
+    cluster.status                  := "deactivated"
+    cluster.breakthrough_count      := 0
+    cluster.pending_confirmation_bar := 0
+    cluster.has_touched_level       := false
+    cluster.came_from_correct_side  := false
+    cluster.breakthrough_in_progress := false
+    cluster.upper_offset_touched    := false
+    cluster.lower_offset_touched    := false
+
+// ============================================================================
+// СИНХРОНИЗАЦИЯ И ОЧИСТКА
+// ============================================================================
+
+is_cluster_truly_active(UnifiedClusterData cluster) =>
+    bool ok = cluster.status == "active"
+    if ok and show_cluster_lines
+        ok := not na(cluster.cluster_line)
+    if ok and show_offset_lines
+        ok := not na(cluster.upper_offset_line) and not na(cluster.lower_offset_line)
+    ok
+
+cleanup_inactive_clusters() =>
+    int sz = array.size(unified_clusters)
+    if sz > 0
+        for i = sz - 1 to 0
+            if array.get(unified_clusters, i).status == "deactivated"
+                array.remove(unified_clusters, i)
+
+sync_cluster_array() =>
+    int sz = array.size(unified_clusters)
+    if sz > 0
+        for i = 0 to sz - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active" and not is_cluster_truly_active(cl)
+                deactivate_cluster_immediately(cl)
+    cleanup_inactive_clusters()
+
+limit_graphics_objects() =>
+    sync_cluster_array()
+
+    int active_count = 0
+    int sz = array.size(unified_clusters)
+    if sz > 0
+        for i = 0 to sz - 1
+            if array.get(unified_clusters, i).status == "active"
+                active_count += 1
+
+    if active_count > max_active_clusters
+        int sz2 = array.size(unified_clusters)
+        if sz2 > 1
+            for i = 0 to sz2 - 2
+                for j = 0 to sz2 - i - 2
+                    if j + 1 < sz2
+                        UnifiedClusterData a = array.get(unified_clusters, j)
+                        UnifiedClusterData b = array.get(unified_clusters, j + 1)
+                        if a.status == "active" and b.status == "active"
+                            if a.start_bar > b.start_bar
+                                array.set(unified_clusters, j, b)
+                                array.set(unified_clusters, j + 1, a)
+
+        int to_remove = active_count - max_active_clusters
+        int removed = 0
+        int sz3 = array.size(unified_clusters)
+        if sz3 > 0
+            for i = 0 to sz3 - 1
+                if removed >= to_remove
+                    break
+                UnifiedClusterData cl = array.get(unified_clusters, i)
+                if cl.status == "active"
+                    deactivate_cluster_immediately(cl)
+                    removed += 1
+
+// ============================================================================
+// ЛОГИКА ЗАПИЛОВ — МЕТКИ
+// ============================================================================
+
+create_breakthrough_label(UnifiedClusterData cluster, int breakthrough_num) =>
+    color lbl_col = color.gray
+    if cluster.is_high
+        lbl_col := breakthrough_num >= max_breakthroughs ? color.red : color.lime
+    else
+        lbl_col := breakthrough_num >= max_breakthroughs ? #8B0000 : color.orange
+
+    string txt = "BT" + str.tostring(breakthrough_num) + (cluster.is_high ? "↑" : "↓")
+    label lbl = label.new(
+         x=bar_index, y=cluster.avg_level,
+         text=txt,
+         style=cluster.is_high ? label.style_label_down : label.style_label_up,
+         color=lbl_col, textcolor=color.white,
+         size=BREAKTHROUGH_LABEL_SIZE)
+
+    array.push(cluster.breakthrough_labels, lbl)
+
+    BreakthroughLabelInfo info = BreakthroughLabelInfo.new(
+         label_obj=lbl, breakthrough_num=breakthrough_num,
+         level=cluster.avg_level, created_bar=bar_index)
+    array.push(bt_label_infos, info)
+
+    string side_str = cluster.is_high ? "хай" : "лоу"
+    alert(str.tostring(breakthrough_num) + "-й запил " + side_str + " уровня! Цена: " + str.tostring(close, "#.########") + ", Уровень: " + str.tostring(cluster.avg_level, "#.########"), alert.freq_once_per_bar)
+
+// ============================================================================
+// ПРОВЕРКА OFFSET-КАСАНИЙ
+// ============================================================================
+
+check_offset_touch(UnifiedClusterData cluster) =>
+    bool should_upper = false
+    bool should_lower = false
+
+    if cluster.status == "active"
+        if cluster.upper_offset_touched
+            if math.abs(close - cluster.upper_offset_level) > cluster.upper_offset_level * 0.001
+                cluster.upper_offset_touched := false
+        if cluster.lower_offset_touched
+            if math.abs(close - cluster.lower_offset_level) > cluster.lower_offset_level * 0.001
+                cluster.lower_offset_touched := false
+
+        if not cluster.upper_offset_touched
+            bool std_upper = low <= cluster.upper_offset_level and high >= cluster.upper_offset_level
+            bool gap_upper = false
+            if bar_index > 0
+                gap_upper := (close[1] < cluster.upper_offset_level and open > cluster.upper_offset_level) or (close[1] > cluster.upper_offset_level and open < cluster.upper_offset_level)
+            if std_upper or gap_upper
+                cluster.upper_offset_touched := true
+                should_upper := true
+
+        if not cluster.lower_offset_touched
+            bool std_lower = low <= cluster.lower_offset_level and high >= cluster.lower_offset_level
+            bool gap_lower = false
+            if bar_index > 0
+                gap_lower := (close[1] < cluster.lower_offset_level and open > cluster.lower_offset_level) or (close[1] > cluster.lower_offset_level and open < cluster.lower_offset_level)
+            if std_lower or gap_lower
+                cluster.lower_offset_touched := true
+                should_lower := true
+
+    [should_upper, should_lower]
+
+// ============================================================================
+// ОСНОВНАЯ ЛОГИКА — ПИВОТЫ
+// ============================================================================
+
+float ph = ta.pivothigh(high, leftBars, rightBars)
+float pl = ta.pivotlow(low, leftBars, rightBars)
+
+if not na(ph)
+    int pivot_bar = bar_index - rightBars
+    int pivot_tm  = time[rightBars]
+    ExtremumData ext = ExtremumData.new(price=ph, bar_idx=pivot_bar, bar_tm=pivot_tm, is_clustered=false)
+    array.push(high_extremums, ext)
+    limit_array_size(high_extremums)
+    label.new(pivot_bar, ph, "H", color=color.green, textcolor=color.white, style=label.style_label_down, size=PIVOT_LABEL_SIZE)
+
+if not na(pl)
+    int pivot_bar = bar_index - rightBars
+    int pivot_tm  = time[rightBars]
+    ExtremumData ext = ExtremumData.new(price=pl, bar_idx=pivot_bar, bar_tm=pivot_tm, is_clustered=false)
+    array.push(low_extremums, ext)
+    limit_array_size(low_extremums)
+    label.new(pivot_bar, pl, "L", color=color.yellow, textcolor=color.black, style=label.style_label_up, size=PIVOT_LABEL_SIZE)
+
+// ============================================================================
+// АБСОЛЮТНЫЕ ЭКСТРЕМУМЫ
+// ============================================================================
+
+if barstate.islast and show_absolute_lines
+    [abs_h, abs_l] = find_absolute_extremums()
+    if not na(abs_high_line)
+        line.delete(abs_high_line)
+    if not na(abs_low_line)
+        line.delete(abs_low_line)
+    abs_high_line := line.new(bar_index - lookback_bars, abs_h, bar_index, abs_h, color=color.red, width=ABS_LINE_WIDTH, style=line.style_solid, extend=extend.right)
+    abs_low_line  := line.new(bar_index - lookback_bars, abs_l, bar_index, abs_l, color=color.teal, width=ABS_LINE_WIDTH, style=line.style_solid, extend=extend.right)
+
+// ============================================================================
+// ПЕРЕСЧЁТ КЛАСТЕРОВ
+// ============================================================================
+
+float price_change_10 = bar_index >= 10 ? math.abs(close - close[10]) / close[10] : 0.0
+bool recalc_trigger = (bar_index % recalc_bars == 0 and barstate.isconfirmed) or barstate.islast or price_change_10 > 0.02
+
+if recalc_trigger
+    array<string> saved_ids       = array.new<string>()
+    array<int>    saved_bt_counts = array.new<int>()
+    array<int>    saved_last_bars = array.new<int>()
+
+    int uc_sz_save = array.size(unified_clusters)
+    if preserve_labels and uc_sz_save > 0
+        for i = 0 to uc_sz_save - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active" and cl.breakthrough_count > 0
+                array.push(saved_ids, cl.cluster_id)
+                array.push(saved_bt_counts, cl.breakthrough_count)
+                array.push(saved_last_bars, cl.last_breakthrough_bar)
+
+    int uc_sz_clean = array.size(unified_clusters)
+    if uc_sz_clean > 0
+        for i = uc_sz_clean - 1 to 0
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if preserve_labels
+                delete_cluster_graphics(cl)
+            else
+                deactivate_cluster_immediately(cl)
+
+    if not preserve_labels
+        cleanup_inactive_clusters()
+
+    array<UnifiedClusterData> new_high_clusters = find_clusters(high_extremums, true)
+    array<UnifiedClusterData> new_low_clusters  = find_clusters(low_extremums, false)
+
+    int nhc_sz = array.size(new_high_clusters)
+    if nhc_sz > 0
+        for i = 0 to nhc_sz - 1
+            UnifiedClusterData cl = array.get(new_high_clusters, i)
+            create_cluster_graphics(cl)
+
+            int sid_sz = array.size(saved_ids)
+            if preserve_labels and sid_sz > 0
+                for s = 0 to sid_sz - 1
+                    if cl.cluster_id == array.get(saved_ids, s)
+                        cl.breakthrough_count := array.get(saved_bt_counts, s)
+                        cl.last_breakthrough_bar := array.get(saved_last_bars, s)
+                        break
+
+            array.push(unified_clusters, cl)
+
+    int nlc_sz = array.size(new_low_clusters)
+    if nlc_sz > 0
+        for i = 0 to nlc_sz - 1
+            UnifiedClusterData cl = array.get(new_low_clusters, i)
+            create_cluster_graphics(cl)
+
+            int sid_sz = array.size(saved_ids)
+            if preserve_labels and sid_sz > 0
+                for s = 0 to sid_sz - 1
+                    if cl.cluster_id == array.get(saved_ids, s)
+                        cl.breakthrough_count := array.get(saved_bt_counts, s)
+                        cl.last_breakthrough_bar := array.get(saved_last_bars, s)
+                        break
+
+            array.push(unified_clusters, cl)
+
+    if preserve_labels
+        cleanup_inactive_clusters()
+
+// ============================================================================
+// ПРОВЕРКА OFFSET-КАСАНИЙ
+// ============================================================================
+
+if enable_offset_alerts
+    sync_cluster_array()
+    int uc_sz_oa = array.size(unified_clusters)
+    if uc_sz_oa > 0
+        for i = 0 to uc_sz_oa - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active"
+                [should_up, should_dn] = check_offset_touch(cl)
+                string side = cl.is_high ? "хай" : "лоу"
+
+                if should_up
+                    if is_valid_offset_alert(cl.upper_offset_level, close, alert_tolerance_percent)
+                        alert("Касание верхней offset линии " + side + " кластера! Уровень: " + str.tostring(cl.upper_offset_level, "#.########"), alert.freq_once_per_bar)
+
+                if should_dn
+                    if is_valid_offset_alert(cl.lower_offset_level, close, alert_tolerance_percent)
+                        alert("Касание нижней offset линии " + side + " кластера! Уровень: " + str.tostring(cl.lower_offset_level, "#.########"), alert.freq_once_per_bar)
+
+// ============================================================================
+// ЛОГИКА ЗАПИЛОВ
+// ============================================================================
+
+if enable_breakthrough_logic
+    int uc_sz_bt = array.size(unified_clusters)
+    if uc_sz_bt > 0
+        for i = 0 to uc_sz_bt - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active"
+
+                if cl.breakthrough_in_progress and bar_index >= cl.pending_confirmation_bar
+                    if check_confirmation_simple(cl)
+                        cl.breakthrough_count += 1
+                        cl.last_breakthrough_bar := bar_index
+                        cl.breakthrough_in_progress := false
+                        cl.has_touched_level := false
+                        cl.came_from_correct_side := false
+
+                        if show_breakthrough_labels
+                            create_breakthrough_label(cl, cl.breakthrough_count)
+
+                        if cl.breakthrough_count >= max_breakthroughs
+                            deactivate_cluster_immediately(cl)
+                    else
+                        cl.breakthrough_in_progress := false
+                        cl.has_touched_level := false
+                        cl.came_from_correct_side := false
+
+                else if not cl.breakthrough_in_progress
+                    if check_level_touch(cl.avg_level)
+                        bool correct_side = check_approach_direction(cl.avg_level, cl.is_high)
+                        if correct_side
+                            cl.has_touched_level := true
+                            cl.came_from_correct_side := true
+                            cl.breakthrough_in_progress := true
+                            cl.pending_confirmation_bar := bar_index + bars_offset
+
+                            string side = cl.is_high ? "HIGH" : "LOW"
+                            alert("Касание обнаружено! " + side + " кластер Уровень: " + str.tostring(cl.avg_level, "#.########") + " Подтверждение на баре: " + str.tostring(bar_index + bars_offset), alert.freq_once_per_bar)
+
+// ============================================================================
+// ОЧИСТКА СТАРЫХ МЕТОК ЗАПИЛОВ (>300 баров)
+// ============================================================================
+
+int bt_info_sz = array.size(bt_label_infos)
+if bt_info_sz > 0
+    for i = bt_info_sz - 1 to 0
+        BreakthroughLabelInfo info = array.get(bt_label_infos, i)
+        if bar_index - info.created_bar > 300
+            if not na(info.label_obj)
+                label.delete(info.label_obj)
+            array.remove(bt_label_infos, i)
+
+// ============================================================================
+// ОГРАНИЧЕНИЕ АКТИВНЫХ КЛАСТЕРОВ
+// ============================================================================
+
+limit_graphics_objects()
+
+// ============================================================================
+// СБРОС ФЛАГОВ АЛЕРТОВ
+// ============================================================================
+
+alert_upper_offset_fired := false
+alert_lower_offset_fired := false
+
+// ============================================================================
+// JSON-ЭКСПОРТ (единожды, на последнем баре)
+// ============================================================================
+
+if barstate.islast and not data_exported
+    data_exported := true
+
+    [abs_h_exp, abs_l_exp] = find_absolute_extremums()
+
+    string json = "=== CLUSTER DATA EXPORT START ===\n{\n"
+    json += '  "symbol": "' + syminfo.tickerid + '",\n'
+    json += '  "timeframe": "' + timeframe.period + '",\n'
+    json += '  "timezone": "' + syminfo.timezone + '",\n'
+    json += '  "timestamp_unix": ' + str.tostring(timenow) + ',\n'
+    json += '  "current_price": ' + str.tostring(close, "#.########") + ',\n'
+    json += '  "current_bar": ' + str.tostring(bar_index) + ',\n'
+
+    json += '  "high_extremums": [\n'
+    int h_sz = array.size(high_extremums)
+    if h_sz > 0
+        for i = 0 to h_sz - 1
+            ExtremumData ext = array.get(high_extremums, i)
+            json += '    {"i":' + str.tostring(i) + ',"p":' + str.tostring(ext.price, "#.########")
+            json += ',"bi":' + str.tostring(ext.bar_idx) + ',"ago":' + str.tostring(bar_index - ext.bar_idx)
+            json += ',"ts":' + str.tostring(ext.bar_tm) + '}'
+            json += i < h_sz - 1 ? ',\n' : '\n'
+    json += '  ],\n'
+
+    json += '  "low_extremums": [\n'
+    int l_sz = array.size(low_extremums)
+    if l_sz > 0
+        for i = 0 to l_sz - 1
+            ExtremumData ext = array.get(low_extremums, i)
+            json += '    {"i":' + str.tostring(i) + ',"p":' + str.tostring(ext.price, "#.########")
+            json += ',"bi":' + str.tostring(ext.bar_idx) + ',"ago":' + str.tostring(bar_index - ext.bar_idx)
+            json += ',"ts":' + str.tostring(ext.bar_tm) + '}'
+            json += i < l_sz - 1 ? ',\n' : '\n'
+    json += '  ],\n'
+
+    json += '  "clusters": [\n'
+    int c_sz = array.size(unified_clusters)
+    int c_num = 0
+    if c_sz > 0
+        for i = 0 to c_sz - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active"
+                c_num += 1
+                float dist = close - cl.avg_level
+                float dist_pct = dist / cl.avg_level * 100.0
+                string c_type = cl.is_high ? "resistance" : "support"
+                int age = bar_index - cl.end_bar
+                int dur = cl.end_bar - cl.start_bar
+
+                json += '    {"num":' + str.tostring(c_num)
+                json += ',"id":"' + cl.cluster_id + '"'
+                json += ',"type":"' + c_type + '"'
+                json += ',"avg":' + str.tostring(cl.avg_level, "#.########")
+                json += ',"size":' + str.tostring(cl.cluster_size)
+                json += ',"bk_cnt":' + str.tostring(cl.breakthrough_count)
+                json += ',"up_off":' + str.tostring(cl.upper_offset_level, "#.########")
+                json += ',"dn_off":' + str.tostring(cl.lower_offset_level, "#.########")
+                json += ',"dist":' + str.tostring(dist, "#.########")
+                json += ',"dist_pct":"' + str.tostring(dist_pct, "#.##") + '%"'
+                json += ',"start_ts":' + str.tostring(cl.start_time)
+                json += ',"end_ts":' + str.tostring(cl.end_time)
+                json += ',"dur":' + str.tostring(dur)
+                json += ',"age":' + str.tostring(age)
+                json += '}'
+                json += i < c_sz - 1 ? ',\n' : '\n'
+    json += '  ],\n'
+
+    json += '  "absolute_extremums": {\n'
+    json += '    "high": ' + str.tostring(abs_h_exp, "#.########") + ',\n'
+    json += '    "low": ' + str.tostring(abs_l_exp, "#.########") + '\n'
+    json += '  },\n'
+
+    int res_cnt = 0
+    int sup_cnt = 0
+    if c_sz > 0
+        for i = 0 to c_sz - 1
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if cl.status == "active"
+                if cl.is_high
+                    res_cnt += 1
+                else
+                    sup_cnt += 1
+
+    json += '  "stats": {\n'
+    json += '    "total_highs": ' + str.tostring(h_sz) + ',\n'
+    json += '    "total_lows": ' + str.tostring(l_sz) + ',\n'
+    json += '    "res_clusters": ' + str.tostring(res_cnt) + ',\n'
+    json += '    "sup_clusters": ' + str.tostring(sup_cnt) + '\n'
+    json += '  }\n'
+    json += '}\n=== CLUSTER DATA EXPORT END ==='
+
+    int chunk_size = 3000
+    int json_len = str.length(json)
+    int pos = 0
+    while pos < json_len
+        int end_pos = math.min(pos + chunk_size, json_len)
+        string chunk = str.substring(json, pos, end_pos)
+        log.info(chunk)
+        pos := end_pos

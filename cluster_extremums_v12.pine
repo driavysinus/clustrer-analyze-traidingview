@@ -14,10 +14,10 @@ rightBars       = input.int(10,    "Баров справа",              minva
 lookback_bars   = input.int(1000,  "Глубина поиска абс. экстр.",minval=50, maxval=5000, group="Поиск экстремумов")
 
 // --- Группа: Кластеризация ---
-cluster_threshold       = input.float(2.0,  "Порог кластера (%)",        minval=0.001, step=0.001, group="Кластеризация") / 100.0
-min_cluster_size        = input.int(4,       "Мин. размер кластера",      minval=2,     group="Кластеризация")
+cluster_threshold       = input.float(0.01,  "Порог кластера (%)",        minval=0.001, step=0.001, group="Кластеризация") / 100.0
+min_cluster_size        = input.int(3,       "Мин. размер кластера",      minval=2,     group="Кластеризация")
 use_only_recent         = input.bool(true,   "Только последние экстремумы",              group="Кластеризация")
-recent_extremums_count  = input.int(30,      "Кол-во последних экстремумов",minval=10,  group="Кластеризация")
+recent_extremums_count  = input.int(90,      "Кол-во последних экстремумов",minval=10,  group="Кластеризация")
 recalc_bars             = input.int(500,     "Пересчёт каждые N баров",   minval=10,    group="Кластеризация")
 max_active_clusters     = input.int(15,      "Макс. активных кластеров",  minval=1, maxval=20, group="Кластеризация")
 
@@ -531,75 +531,48 @@ if barstate.islast and show_absolute_lines
     abs_low_line  := line.new(bar_index - lookback_bars, abs_l, bar_index, abs_l, color=color.teal, width=ABS_LINE_WIDTH, style=line.style_solid, extend=extend.right)
 
 // ============================================================================
-// ПЕРЕСЧЁТ КЛАСТЕРОВ
+// ЛОГИКА ЗАПИЛОВ (ДО пересчёта, чтобы состояние не терялось)
 // ============================================================================
 
-float price_change_10 = bar_index >= 10 ? math.abs(close - close[10]) / close[10] : 0.0
-bool recalc_trigger = (bar_index % recalc_bars == 0 and barstate.isconfirmed) or barstate.islast or price_change_10 > 0.02
-
-if recalc_trigger
-    array<string> saved_ids       = array.new<string>()
-    array<int>    saved_bt_counts = array.new<int>()
-    array<int>    saved_last_bars = array.new<int>()
-
-    int uc_sz_save = array.size(unified_clusters)
-    if preserve_labels and uc_sz_save > 0
-        for i = 0 to uc_sz_save - 1
+if enable_breakthrough_logic
+    int uc_sz_bt = array.size(unified_clusters)
+    if uc_sz_bt > 0
+        for i = 0 to uc_sz_bt - 1
             UnifiedClusterData cl = array.get(unified_clusters, i)
-            if cl.status == "active" and cl.breakthrough_count > 0
-                array.push(saved_ids, cl.cluster_id)
-                array.push(saved_bt_counts, cl.breakthrough_count)
-                array.push(saved_last_bars, cl.last_breakthrough_bar)
+            if cl.status == "active"
 
-    int uc_sz_clean = array.size(unified_clusters)
-    if uc_sz_clean > 0
-        for i = uc_sz_clean - 1 to 0
-            UnifiedClusterData cl = array.get(unified_clusters, i)
-            if preserve_labels
-                delete_cluster_graphics(cl)
-            else
-                deactivate_cluster_immediately(cl)
+                // 1. Проверка отложенного подтверждения
+                if cl.breakthrough_in_progress and bar_index >= cl.pending_confirmation_bar
+                    if check_confirmation_simple(cl)
+                        cl.breakthrough_count += 1
+                        cl.last_breakthrough_bar := bar_index
+                        cl.breakthrough_in_progress := false
+                        cl.has_touched_level := false
+                        cl.came_from_correct_side := false
 
-    if not preserve_labels
-        cleanup_inactive_clusters()
+                        if show_breakthrough_labels
+                            create_breakthrough_label(cl, cl.breakthrough_count)
 
-    array<UnifiedClusterData> new_high_clusters = find_clusters(high_extremums, true)
-    array<UnifiedClusterData> new_low_clusters  = find_clusters(low_extremums, false)
+                        if cl.breakthrough_count >= max_breakthroughs
+                            deactivate_cluster_immediately(cl)
+                    else
+                        // Подтверждение не прошло — сброс
+                        cl.breakthrough_in_progress := false
+                        cl.has_touched_level := false
+                        cl.came_from_correct_side := false
 
-    int nhc_sz = array.size(new_high_clusters)
-    if nhc_sz > 0
-        for i = 0 to nhc_sz - 1
-            UnifiedClusterData cl = array.get(new_high_clusters, i)
-            create_cluster_graphics(cl)
+                // 2. Поиск нового касания
+                else if not cl.breakthrough_in_progress
+                    if check_level_touch(cl.avg_level)
+                        bool correct_side = check_approach_direction(cl.avg_level, cl.is_high)
+                        if correct_side
+                            cl.has_touched_level := true
+                            cl.came_from_correct_side := true
+                            cl.breakthrough_in_progress := true
+                            cl.pending_confirmation_bar := bar_index + bars_offset
 
-            int sid_sz = array.size(saved_ids)
-            if preserve_labels and sid_sz > 0
-                for s = 0 to sid_sz - 1
-                    if cl.cluster_id == array.get(saved_ids, s)
-                        cl.breakthrough_count := array.get(saved_bt_counts, s)
-                        cl.last_breakthrough_bar := array.get(saved_last_bars, s)
-                        break
-
-            array.push(unified_clusters, cl)
-
-    int nlc_sz = array.size(new_low_clusters)
-    if nlc_sz > 0
-        for i = 0 to nlc_sz - 1
-            UnifiedClusterData cl = array.get(new_low_clusters, i)
-            create_cluster_graphics(cl)
-
-            int sid_sz = array.size(saved_ids)
-            if preserve_labels and sid_sz > 0
-                for s = 0 to sid_sz - 1
-                    if cl.cluster_id == array.get(saved_ids, s)
-                        cl.breakthrough_count := array.get(saved_bt_counts, s)
-                        cl.last_breakthrough_bar := array.get(saved_last_bars, s)
-                        break
-
-            array.push(unified_clusters, cl)
-
-    if preserve_labels
-        cleanup_inactive_clusters()
+                            string side = cl.is_high ? "HIGH" : "LOW"
+                            alert("Касание обнаружено! " + side + " кластер Уровень: " + str.tostring(cl.avg_level, "#.########") + " Подтверждение на баре: " + str.tostring(bar_index + bars_offset), alert.freq_once_per_bar)
 
 // ============================================================================
 // ПРОВЕРКА OFFSET-КАСАНИЙ
@@ -624,45 +597,117 @@ if enable_offset_alerts
                         alert("Касание нижней offset линии " + side + " кластера! Уровень: " + str.tostring(cl.lower_offset_level, "#.########"), alert.freq_once_per_bar)
 
 // ============================================================================
-// ЛОГИКА ЗАПИЛОВ
+// ПЕРЕСЧЁТ КЛАСТЕРОВ
 // ============================================================================
 
-if enable_breakthrough_logic
-    int uc_sz_bt = array.size(unified_clusters)
-    if uc_sz_bt > 0
-        for i = 0 to uc_sz_bt - 1
+// Пересчёт НЕ на каждом тике islast — только при первом построении
+// или по расписанию на подтверждённых барах, или при сильном движении
+var bool initial_build_done = false
+float price_change_10 = bar_index >= 10 ? math.abs(close - close[10]) / close[10] : 0.0
+bool recalc_trigger = false
+
+if not initial_build_done and barstate.islast
+    recalc_trigger := true
+    initial_build_done := true
+else if bar_index % recalc_bars == 0 and barstate.isconfirmed
+    recalc_trigger := true
+else if price_change_10 > 0.02 and barstate.isconfirmed
+    recalc_trigger := true
+
+if recalc_trigger
+    // ВСЕГДА сохраняем состояние запилов (не только при preserve_labels)
+    array<float> saved_levels      = array.new<float>()
+    array<bool>  saved_is_high     = array.new<bool>()
+    array<int>   saved_bt_counts   = array.new<int>()
+    array<int>   saved_last_bars   = array.new<int>()
+    array<int>   saved_pending_bar = array.new<int>()
+    array<bool>  saved_in_progress = array.new<bool>()
+    array<bool>  saved_touched     = array.new<bool>()
+    array<bool>  saved_correct_side = array.new<bool>()
+
+    int uc_sz_save = array.size(unified_clusters)
+    if uc_sz_save > 0
+        for i = 0 to uc_sz_save - 1
             UnifiedClusterData cl = array.get(unified_clusters, i)
             if cl.status == "active"
+                array.push(saved_levels, cl.avg_level)
+                array.push(saved_is_high, cl.is_high)
+                array.push(saved_bt_counts, cl.breakthrough_count)
+                array.push(saved_last_bars, cl.last_breakthrough_bar)
+                array.push(saved_pending_bar, cl.pending_confirmation_bar)
+                array.push(saved_in_progress, cl.breakthrough_in_progress)
+                array.push(saved_touched, cl.has_touched_level)
+                array.push(saved_correct_side, cl.came_from_correct_side)
 
-                if cl.breakthrough_in_progress and bar_index >= cl.pending_confirmation_bar
-                    if check_confirmation_simple(cl)
-                        cl.breakthrough_count += 1
-                        cl.last_breakthrough_bar := bar_index
-                        cl.breakthrough_in_progress := false
-                        cl.has_touched_level := false
-                        cl.came_from_correct_side := false
+    // Очистка старой графики (но не меток запилов если preserve_labels)
+    int uc_sz_clean = array.size(unified_clusters)
+    if uc_sz_clean > 0
+        for i = uc_sz_clean - 1 to 0
+            UnifiedClusterData cl = array.get(unified_clusters, i)
+            if preserve_labels
+                delete_cluster_graphics(cl)
+            else
+                deactivate_cluster_immediately(cl)
 
-                        if show_breakthrough_labels
-                            create_breakthrough_label(cl, cl.breakthrough_count)
+    if not preserve_labels
+        cleanup_inactive_clusters()
 
-                        if cl.breakthrough_count >= max_breakthroughs
-                            deactivate_cluster_immediately(cl)
-                    else
-                        cl.breakthrough_in_progress := false
-                        cl.has_touched_level := false
-                        cl.came_from_correct_side := false
+    // Поиск новых кластеров
+    array<UnifiedClusterData> new_high_clusters = find_clusters(high_extremums, true)
+    array<UnifiedClusterData> new_low_clusters  = find_clusters(low_extremums, false)
 
-                else if not cl.breakthrough_in_progress
-                    if check_level_touch(cl.avg_level)
-                        bool correct_side = check_approach_direction(cl.avg_level, cl.is_high)
-                        if correct_side
-                            cl.has_touched_level := true
-                            cl.came_from_correct_side := true
-                            cl.breakthrough_in_progress := true
-                            cl.pending_confirmation_bar := bar_index + bars_offset
+    // Добавляем HIGH кластеры и восстанавливаем состояние запилов
+    int nhc_sz = array.size(new_high_clusters)
+    if nhc_sz > 0
+        for i = 0 to nhc_sz - 1
+            UnifiedClusterData cl = array.get(new_high_clusters, i)
+            create_cluster_graphics(cl)
 
-                            string side = cl.is_high ? "HIGH" : "LOW"
-                            alert("Касание обнаружено! " + side + " кластер Уровень: " + str.tostring(cl.avg_level, "#.########") + " Подтверждение на баре: " + str.tostring(bar_index + bars_offset), alert.freq_once_per_bar)
+            // Восстановление состояния по близости avg_level (а не по id)
+            int sid_sz = array.size(saved_levels)
+            if sid_sz > 0
+                float match_thresh = cl.avg_level * cluster_threshold
+                for s = 0 to sid_sz - 1
+                    if array.get(saved_is_high, s) == true
+                        if math.abs(cl.avg_level - array.get(saved_levels, s)) <= match_thresh
+                            cl.breakthrough_count      := array.get(saved_bt_counts, s)
+                            cl.last_breakthrough_bar   := array.get(saved_last_bars, s)
+                            cl.pending_confirmation_bar := array.get(saved_pending_bar, s)
+                            cl.breakthrough_in_progress := array.get(saved_in_progress, s)
+                            cl.has_touched_level       := array.get(saved_touched, s)
+                            cl.came_from_correct_side  := array.get(saved_correct_side, s)
+                            // Пометим как использованный (ставим level = -1)
+                            array.set(saved_levels, s, -1.0)
+                            break
+
+            array.push(unified_clusters, cl)
+
+    // Добавляем LOW кластеры
+    int nlc_sz = array.size(new_low_clusters)
+    if nlc_sz > 0
+        for i = 0 to nlc_sz - 1
+            UnifiedClusterData cl = array.get(new_low_clusters, i)
+            create_cluster_graphics(cl)
+
+            int sid_sz = array.size(saved_levels)
+            if sid_sz > 0
+                float match_thresh = cl.avg_level * cluster_threshold
+                for s = 0 to sid_sz - 1
+                    if array.get(saved_is_high, s) == false and array.get(saved_levels, s) > 0
+                        if math.abs(cl.avg_level - array.get(saved_levels, s)) <= match_thresh
+                            cl.breakthrough_count      := array.get(saved_bt_counts, s)
+                            cl.last_breakthrough_bar   := array.get(saved_last_bars, s)
+                            cl.pending_confirmation_bar := array.get(saved_pending_bar, s)
+                            cl.breakthrough_in_progress := array.get(saved_in_progress, s)
+                            cl.has_touched_level       := array.get(saved_touched, s)
+                            cl.came_from_correct_side  := array.get(saved_correct_side, s)
+                            array.set(saved_levels, s, -1.0)
+                            break
+
+            array.push(unified_clusters, cl)
+
+    if preserve_labels
+        cleanup_inactive_clusters()
 
 // ============================================================================
 // ОЧИСТКА СТАРЫХ МЕТОК ЗАПИЛОВ (>300 баров)
